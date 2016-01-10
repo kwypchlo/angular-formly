@@ -112,28 +112,37 @@ function formlyForm(formlyUsability, formlyWarn, $parse, formlyConfig, $interpol
     setupFields()
 
     // watch the model and evaluate watch expressions that depend on it.
-    $scope.$watch('model', onModelOrFormStateChange, true)
+    if (!$scope.options.manualModelWatcher) {
+      $scope.$watch('model', onModelOrFormStateChange, true)
+    } else if (angular.isFunction($scope.options.manualModelWatcher)) {
+      $scope.$watch($scope.options.manualModelWatcher, onModelOrFormStateChange, true)
+    }
+
     if ($scope.options.formState) {
       $scope.$watch('options.formState', onModelOrFormStateChange, true)
     }
 
     function onModelOrFormStateChange() {
-      angular.forEach($scope.fields, function runFieldExpressionProperties(field, index) {
+      angular.forEach($scope.fields, runFieldExpressionProperties)
+    }
+
+    function runFieldExpressionProperties(field, index) {
+      const promise = field.runExpressions && field.runExpressions()
+      if (field.hideExpression) { // can't use hide with expressionProperties reliably
         const model = field.model || $scope.model
-        const promise = field.runExpressions && field.runExpressions()
-        if (field.hideExpression) { // can't use hide with expressionProperties reliably
-          const val = model[field.key]
-          field.hide = evalCloseToFormlyExpression(field.hideExpression, val, field, index)
+        // add model to extra locals to be sure the expression is evaluated in correct context
+        const extraLocals = angular.extend(getFormlyFieldLikeLocals(field, index), {model})
+        const val = model[field.key]
+        field.hide = formlyUtil.formlyEval($scope, field.hideExpression, val, val, extraLocals)
+      }
+      if (field.extras && field.extras.validateOnModelChange && field.formControl) {
+        const validate = field.formControl.$validate
+        if (promise) {
+          promise.then(validate)
+        } else {
+          validate()
         }
-        if (field.extras && field.extras.validateOnModelChange && field.formControl) {
-          const validate = field.formControl.$validate
-          if (promise) {
-            promise.then(validate)
-          } else {
-            validate()
-          }
-        }
-      })
+      }
     }
 
     function setupFields() {
@@ -157,6 +166,10 @@ function formlyForm(formlyUsability, formlyWarn, $parse, formlyConfig, $interpol
       })
 
       setupModels()
+
+      if ($scope.options.watchAllExpressions) {
+        angular.forEach($scope.fields, setupExpressionWatchers)
+      }
 
       angular.forEach($scope.fields, attachKey) // attaches a key based on the index if a key isn't specified
       angular.forEach($scope.fields, setupWatchers) // setup watchers for all fields
@@ -217,6 +230,8 @@ function formlyForm(formlyUsability, formlyWarn, $parse, formlyConfig, $interpol
     function setupModels() {
       // a set of field models that are already watched (the $scope.model will have its own watcher)
       const watchedModels = [$scope.model]
+      // we will not set up automatic model watchers if manual mode is set
+      const manualModelWatcher = $scope.options.manualModelWatcher
 
       if ($scope.options.formState) {
         // $scope.options.formState will have its own watcher
@@ -226,11 +241,23 @@ function formlyForm(formlyUsability, formlyWarn, $parse, formlyConfig, $interpol
       angular.forEach($scope.fields, (field) => {
         const isNewModel = initModel(field)
 
-        if (field.model && isNewModel && watchedModels.indexOf(field.model) === -1) {
+        if (field.model && isNewModel && watchedModels.indexOf(field.model) === -1 && !manualModelWatcher) {
           $scope.$watch(() => field.model, onModelOrFormStateChange, true)
           watchedModels.push(field.model)
         }
       })
+    }
+
+    function setupExpressionWatchers(field, index) {
+      if (field.hideExpression) { // can't use hide with expressionProperties reliably
+        const model = field.model || $scope.model
+        // add model to extra locals to be sure the expression is evaluated in correct context
+        const extraLocals = angular.extend(getFormlyFieldLikeLocals(field, index), {model})
+        $scope.$watch(function hideExpressionWatcher() {
+          const val = model[field.key]
+          return formlyUtil.formlyEval($scope, field.hideExpression, val, val, extraLocals)
+        }, (hide) => field.hide = hide, true)
+      }
     }
 
     function initModel(field) {
@@ -240,7 +267,7 @@ function formlyForm(formlyUsability, formlyWarn, $parse, formlyConfig, $interpol
         const expression = field.model
         const index = $scope.fields.indexOf(field)
 
-        isNewModel = !refrencesCurrentlyWatchedModel(expression)
+        isNewModel = !referencesCurrentlyWatchedModel(expression)
 
         field.model = evalCloseToFormlyExpression(expression, undefined, field, index)
         if (!field.model) {
@@ -254,7 +281,7 @@ function formlyForm(formlyUsability, formlyWarn, $parse, formlyConfig, $interpol
       return isNewModel
     }
 
-    function refrencesCurrentlyWatchedModel(expression) {
+    function referencesCurrentlyWatchedModel(expression) {
       return ['model', 'formState'].some(item => {
         return formlyUtil.startsWith(expression, `${item}.`) || formlyUtil.startsWith(expression, `${item}[`)
       })
@@ -275,7 +302,7 @@ function formlyForm(formlyUsability, formlyWarn, $parse, formlyConfig, $interpol
         watchers = [watchers]
       }
       angular.forEach(watchers, function setupWatcher(watcher) {
-        if (!angular.isDefined(watcher.listener)) {
+        if (!angular.isDefined(watcher.listener) && !watcher.runFieldExpressions) {
           throw formlyUsability.getFieldError(
             'all-field-watchers-must-have-a-listener',
             'All field watchers must have a listener', field
@@ -300,19 +327,28 @@ function formlyForm(formlyUsability, formlyWarn, $parse, formlyConfig, $interpol
           return originalExpression(...args)
         }
         watchExpression.displayName = `Formly Watch Expression for field for ${field.key}`
+      } else if (field.model) {
+        watchExpression = $parse(watchExpression).bind(null, $scope, {model: field.model})
       }
       return watchExpression
     }
 
     function getWatchListener(watcher, field, index) {
       let watchListener = watcher.listener
-      if (angular.isFunction(watchListener)) {
+      if (angular.isFunction(watchListener) || watcher.runFieldExpressions) {
         // wrap the field's watch listener so we can call it with the field as the first arg
         // and the stop function as the last arg as a helper
         const originalListener = watchListener
         watchListener = function formlyWatchListener() {
-          const args = modifyArgs(watcher, index, ...arguments)
-          return originalListener(...args)
+          let value
+          if (originalListener) {
+            const args = modifyArgs(watcher, index, ...arguments)
+            value = originalListener(...args)
+          }
+          if (watcher.runFieldExpressions) {
+            runFieldExpressionProperties(field, index)
+          }
+          return value
         }
         watchListener.displayName = `Formly Watch Listener for field for ${field.key}`
       }
